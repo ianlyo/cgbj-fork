@@ -1625,3 +1625,24 @@ impl Host {
         }
     }
 }
+
+#[cfg(test)]
+mod temp_f1687692 {
+    #[test]
+    fn test_f1687692() {
+        let bytes = std::fs::read(r"C:\Users\Ian\.gemini\antigravity\brain\299a5da0-fb94-4d00-825e-9bc1ca98c46b\scratch\f1687692.dxbc").unwrap();
+        let c = crate::Container::parse(&bytes).unwrap();
+        let xbop = c.part(crate::FourCC::DXIL).unwrap();
+        let native = crate::native_programs(xbop.data).unwrap().into_iter().next().unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let host = super::super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        if std::env::var_os("DUMP_CUT").is_some() {
+            std::fs::write(r"C:\Users\Ian\.gemini\antigravity\brain\299a5da0-fb94-4d00-825e-9bc1ca98c46b\scratch\cut_loop_6.dxbc", &host.dxil).unwrap();
+            return;
+        }
+        super::Host::new(false).unwrap().compute_pipeline(&host).unwrap();
+    }
+}
