@@ -1263,6 +1263,30 @@ impl Blocks {
         }
     }
 
+    /// Returns whether every block in `[first, last)` is present, scanning word-by-word.
+    fn all_in(&self, first: usize, last: usize) -> bool {
+        if first >= last {
+            return true;
+        }
+        for piece_id in first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE {
+            let Some(words) = self.0.get(&piece_id) else {
+                return false;
+            };
+            let base = piece_id * Blocks::IN_PIECE;
+            let from = first.max(base) - base;
+            let to = last.min(base + Blocks::IN_PIECE) - base;
+            let w0 = from / 64;
+            let w1 = to.div_ceil(64);
+            for (k, &bits) in words[w0..w1].iter().enumerate() {
+                let mask = in_word((w0 + k) * 64, from, to);
+                if bits & mask != mask {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Those of `range`, in order.
     fn range(&self, range: impl RangeBounds<usize>) -> impl Iterator<Item = usize> + '_ {
         let first = match range.start_bound() {
@@ -1635,54 +1659,53 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
-    // hand, or noted absent) is a view: no question to Windows. The
-    // question walks the page tables to the end of the pages that share the
-    // first one's state, and a guarded view is one long run of read-only
-    // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
-    // of the 68 ms a frame of "guards" (run 58).
-    // `VICTORY_GUARD_ASK=1` asks every time, as before.
+    // hand, or noted absent) is a view: no question to Windows.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ask_always = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
+    let mut held_g = None;
+    let known = !ask_always
         && (PROTECTED.any(first, first + 1) || {
             let g = guards_timed();
-            g.protected.contains(first) || g.absent.contains(first)
+            if g.protected.contains(first) || g.absent.contains(first) {
+                held_g = Some(g);
+                true
+            } else {
+                false
+            }
         });
     if !known && !is_view(start, end) {
         return None;
     }
     install();
-    // The holes that an ordinary commit may have filled, with no word of the
-    // runtime's. Windows is asked with the lock not held (the range is, no
-    // other thread asks about it: `ASKING`); what the runtime tells meanwhile
-    // takes the block out of the set, and it is looked at as any other.
-    let unsure: Vec<usize> = {
-        let g = guards_timed();
-        if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
-            // Nothing written, mapped or new since the range was last taken.
-            #[cfg(feature = "diagnostics")]
-            tally(3, 1);
-            return Some(Vec::new());
-        }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
-    };
-    let mut came: Vec<(usize, bool)> = Vec::new();
-    let mut uncommitted_until = first;
-    for block in unsure {
-        // One question for the blocks of a region.
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
-            #[cfg(feature = "diagnostics")]
-            tally(9, 1);
-        }
-        if block >= uncommitted_until {
-            // The hole may have been given up, and its address be the
-            // title's heap's, or code's, now: not ours to guard.
-            came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
-        }
-    }
     let rest = rest();
-    let mut g = guards_timed();
+    let mut g = held_g.unwrap_or_else(guards_timed);
+    if g.clean.all_in(first, last) && !BESIDE.any(first, last) {
+        // Nothing written, mapped or new since the range was last taken.
+        #[cfg(feature = "diagnostics")]
+        tally(3, 1);
+        return Some(Vec::new());
+    }
+    let unsure: Vec<usize> = g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect();
+    let mut came: Vec<(usize, bool)> = Vec::new();
+    if !unsure.is_empty() {
+        drop(g);
+        let mut uncommitted_until = first;
+        for block in unsure {
+            // One question for the blocks of a region.
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
+                #[cfg(feature = "diagnostics")]
+                tally(9, 1);
+            }
+            if block >= uncommitted_until {
+                // The hole may have been given up, and its address be the
+                // title's heap's, or code's, now: not ours to guard.
+                came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+            }
+        }
+        g = guards_timed();
+    }
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
@@ -2013,19 +2036,40 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    let mut i = 0;
+    while i < blocks.len() {
+        let start = blocks[i];
+        let mut end = start + 1;
+        while i + 1 < blocks.len() && blocks[i + 1] == end {
+            i += 1;
+            end += 1;
+        }
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
-            {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+        // SAFETY: blocks we made read-only.
+        let ok = unsafe { VirtualProtect((start * BLOCK) as *const _, (end - start) * BLOCK, PAGE_READWRITE, &mut old) != 0 };
+        if ok && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+            for block in start..end {
+                PROTECTED.clear(block);
+            }
+        } else {
+            if ok {
+                // SAFETY: restore unexpected protection before falling back per-block.
+                unsafe { VirtualProtect((start * BLOCK) as *const _, (end - start) * BLOCK, old, &mut old) };
+            }
+            for block in start..end {
+                let mut old_one = 0;
+                // SAFETY: a block we made read-only.
+                unsafe {
+                    if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old_one) != 0
+                        && !matches!(old_one, PAGE_READONLY | PAGE_READWRITE)
+                    {
+                        VirtualProtect((block * BLOCK) as *const _, BLOCK, old_one, &mut old_one);
+                    }
+                }
+                PROTECTED.clear(block);
             }
         }
-        PROTECTED.clear(block);
+        i += 1;
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {

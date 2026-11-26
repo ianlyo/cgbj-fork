@@ -265,11 +265,17 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     let mut taken = vec![false; does.len()];
     let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
+    let mut has_copy = false;
     for (i, d) in does.iter().enumerate() {
         match *d {
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
-            Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
+            Does::Copy { asked: true, .. } => {
+                has_copy = true;
+                more.push(i);
+            }
+            Does::Copy { .. } => has_copy = true,
+            Does::Fill { asked: true, .. } => more.push(i),
             _ => {}
         }
     }
@@ -294,6 +300,11 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         }
         if taken.iter().filter(|t| **t).count() > MOST {
             return Err("too many steps depend on it");
+        }
+        // Without any buffer copy in `does`, `written` stays empty and no
+        // remaining step has a non-empty write range `w` to touch `read`.
+        if written.is_empty() && !has_copy {
+            break;
         }
         for (i, d) in does.iter().enumerate() {
             // A fill that cannot be taken is looked at below.
@@ -326,26 +337,28 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         }
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
-    // What stays on the CPU and reads what an earlier taken copy writes
-    // would read it too early.
-    let mut behind: Vec<(usize, usize)> = Vec::new();
-    for (i, d) in does.iter().enumerate() {
-        if taken[i] {
-            if let Some((_, w)) = reads_writes(d)
-                && w.0 < w.1
-            {
-                join_ranges(&mut behind, [w]);
+    if has_copy {
+        // What stays on the CPU and reads what an earlier taken copy writes
+        // would read it too early.
+        let mut behind: Vec<(usize, usize)> = Vec::new();
+        for (i, d) in does.iter().enumerate() {
+            if taken[i] {
+                if let Some((_, w)) = reads_writes(d)
+                    && w.0 < w.1
+                {
+                    join_ranges(&mut behind, [w]);
+                }
+                continue;
             }
-            continue;
-        }
-        match *d {
-            Does::Read { from, to, .. } if touched(&behind, (from, to)) => {
-                return Err("a texture or expanded vertices read what it writes");
+            match *d {
+                Does::Read { from, to, .. } if touched(&behind, (from, to)) => {
+                    return Err("a texture or expanded vertices read what it writes");
+                }
+                Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
+                    return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
+                }
+                _ => {}
             }
-            Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
-                return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
-            }
-            _ => {}
         }
     }
     let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
@@ -360,19 +373,27 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
         // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
-            let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
-                level = at + 1;
-            }
-        }
         if writes {
+            for k in 0..out.len() {
+                let (j, at): (usize, u32) = out[k];
+                if at >= level
+                    && let Some((jr, jw)) = reads_writes(&does[j])
+                    && (meet(jw, r) || meet(jw, w) || meet(jr, w))
+                {
+                    level = at + 1;
+                }
+            }
             copies.push(out.len());
+        } else if !copies.is_empty() {
+            for &k in &copies {
+                let (j, at): (usize, u32) = out[k];
+                if at >= level
+                    && let Some((_, jw)) = reads_writes(&does[j])
+                    && meet(jw, r)
+                {
+                    level = at + 1;
+                }
+            }
         }
         out.push((i, level));
     }
@@ -488,33 +509,97 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     (place(reader)? >= cut).then_some(cut)
 }
 
-/// Whether every page of `[from, to)` can be read (through the kernel:
-/// asking Windows walks the page tables, milliseconds in the title's heap).
-/// `known`: pages that could be, of the same submission: its fills' places
-/// lie eight to a page, and each was read whole to find out.
-fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
-    const PAGE: usize = 4096;
-    (from / PAGE..to.div_ceil(PAGE)).all(|page| {
-        known.contains_key(&page) || {
-            let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
-            if there {
-                known.insert(page, ());
-            }
-            there
+/// Page readability cache for a submission (`4 KiB` pages checked once).
+struct MappedPages {
+    seen: HashMap<usize, ()>,
+    last: usize,
+}
+
+impl MappedPages {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::default(),
+            last: usize::MAX,
         }
-    })
+    }
+
+    fn check(&mut self, from: usize, to: usize) -> bool {
+        const PAGE: usize = 4096;
+        if from < to && from / PAGE == (to - 1) / PAGE && from / PAGE == self.last {
+            return true;
+        }
+        (from / PAGE..to.div_ceil(PAGE)).all(|page| {
+            let ok = self.seen.contains_key(&page) || {
+                let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
+                if there {
+                    self.seen.insert(page, ());
+                }
+                there
+            };
+            if ok {
+                self.last = page;
+            }
+            ok
+        })
+    }
 }
 
 /// A table by addresses and numbers of ours.
 type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
 
-/// Where the bytes of the fill that is `step` (its list by address, its place
-/// in it) go.
-fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
-    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
-    match list.deferred().copies.get(step.1)? {
-        Step::Fill(_, _, _, to) => to.clone(),
-        _ => None,
+/// Caches `holder` lookups by safe sub-interval within agreeing writers, plus exact pairs.
+struct SafeHolders {
+    exact: HashMap<(usize, usize), Arc<Shadow>>,
+    spans: Vec<(Arc<Shadow>, usize, usize)>,
+}
+
+impl SafeHolders {
+    fn new() -> Self {
+        Self {
+            exact: HashMap::default(),
+            spans: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.exact.clear();
+        self.spans.clear();
+    }
+
+    fn get(&mut self, writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+        if let Some((s, _, _)) = self.spans.iter().find(|(_, a, b)| *a <= from && to <= *b) {
+            return Ok(s.clone());
+        }
+        if let Some(s) = self.exact.get(&(from, to - from)) {
+            return Ok(s.clone());
+        }
+        let shadow = holder(writers, from, to)?;
+        if let Some(agree) = writers
+            .iter()
+            .find(|w| w.from <= from && to <= w.to && w.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, &shadow)))
+        {
+            let (start, len) = shadow.span();
+            let mut safe_from = (start as usize).max(agree.from);
+            let mut safe_to = ((start + len) as usize).min(agree.to);
+            for w in writers {
+                if !w.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, &shadow)) {
+                    if w.to <= from {
+                        safe_from = safe_from.max(w.to);
+                    } else if w.from >= to {
+                        safe_to = safe_to.min(w.from);
+                    }
+                }
+            }
+            if safe_from <= from && to <= safe_to {
+                if self.spans.len() >= 8 {
+                    self.spans.remove(0);
+                }
+                self.spans.push((shadow.clone(), safe_from, safe_to));
+                return Ok(shadow);
+            }
+        }
+        self.exact.insert((from, to - from), shadow.clone());
+        Ok(shadow)
     }
 }
 
@@ -524,6 +609,7 @@ struct Op {
     len: usize,
     /// Its place in the buffer between.
     at: u64,
+    read_first: bool,
     level: u32,
     to: To,
 }
@@ -707,78 +793,86 @@ impl Host {
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
         let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
-        // Some 2,800 fills a frame, of a few hundred places: what holds each
-        // is looked for once, as long as no copy is added to the writers.
-        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = HashMap::default();
+        let mut holders = SafeHolders::new();
+        let mut room = MappedPages::new();
         let mut end = 0u64;
-        for &(i, level) in &chosen {
-            let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
-                continue;
-            };
-            let (Does::Copy { len, .. } | Does::Fill { len, .. }) = does[i] else {
-                continue;
-            };
-            if len == 0 {
-                return Err("nothing to read");
+        {
+            let mut locked_list: Option<(usize, _)> = None;
+            for &(i, level) in &chosen {
+                let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
+                    continue;
+                };
+                let (Does::Copy { len, .. } | Does::Fill { len, .. }) = does[i] else {
+                    continue;
+                };
+                if len == 0 {
+                    return Err("nothing to read");
+                }
+                let from = holders.get(&writers, src, src + len)?;
+                let place = (Arc::as_ptr(&from) as usize, src, len, level);
+                let (at, read_first) = match places.get(&place) {
+                    Some(&at) => (at, false),
+                    None => {
+                        if end + len as u64 > BETWEEN {
+                            return Err("too much at once");
+                        }
+                        if !room.check(src, src + len) {
+                            return Err("not all of what it reads is mapped");
+                        }
+                        let at = end;
+                        end = (end + len as u64).next_multiple_of(256);
+                        places.insert(place, at);
+                        (at, true)
+                    }
+                };
+                let to = match does[i] {
+                    Does::Copy { .. } => {
+                        let to = holders.get(&writers, dst, dst + len)?;
+                        if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
+                            return Err("another host copy of what it writes is read");
+                        }
+                        if !room.check(dst, dst + len) {
+                            return Err("not all of what it writes is mapped");
+                        }
+                        // What the steps behind it read of it is in that host
+                        // copy, or nowhere.
+                        writers.push(Writer {
+                            shadow: Some(to.clone()),
+                            from: dst,
+                            to: dst + len,
+                            copy: true,
+                        });
+                        holders.clear();
+                        To::Copy(to, dst)
+                    }
+                    _ => {
+                        let step = steps[i];
+                        if locked_list.as_ref().is_none_or(|(p, _)| *p != step.0) {
+                            locked_list = None;
+                            let Some(list) = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0) else {
+                                continue;
+                            };
+                            locked_list = Some((step.0, list.deferred()));
+                        }
+                        let Some((_, ref guard)) = locked_list else {
+                            continue;
+                        };
+                        match guard.copies.get(step.1) {
+                            Some(Step::Fill(_, _, _, Some(FillTo::Slot(heap, index)))) => To::Slot(*heap, *index),
+                            Some(Step::Fill(_, _, _, Some(FillTo::Buffer(buffer)))) => To::Buffer(buffer.clone()),
+                            _ => continue,
+                        }
+                    }
+                };
+                ops.push(Op {
+                    from: (from, src),
+                    len,
+                    at,
+                    read_first,
+                    level,
+                    to,
+                });
             }
-            let from = match held.get(&(src, len)) {
-                Some(from) => from.clone(),
-                None => {
-                    let from = holder(&writers, src, src + len)?;
-                    held.insert((src, len), from.clone());
-                    from
-                }
-            };
-            let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
-                None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
-                    }
-                    if !mapped(src, src + len, &mut room) {
-                        return Err("not all of what it reads is mapped");
-                    }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
-                }
-            };
-            let to = match does[i] {
-                Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
-                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
-                        return Err("another host copy of what it writes is read");
-                    }
-                    if !mapped(dst, dst + len, &mut room) {
-                        return Err("not all of what it writes is mapped");
-                    }
-                    // What the steps behind it read of it is in that host
-                    // copy, or nowhere.
-                    writers.push(Writer {
-                        shadow: Some(to.clone()),
-                        from: dst,
-                        to: dst + len,
-                        copy: true,
-                    });
-                    held.clear();
-                    To::Copy(to, dst)
-                }
-                _ => match fill_to(runs, steps[i]) {
-                    Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
-                    None => continue,
-                },
-            };
-            ops.push(Op {
-                from: (from, src),
-                len,
-                at,
-                level,
-                to,
-            });
         }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
@@ -789,38 +883,54 @@ impl Host {
         // it: a flush brings a copy up to date from the first range asked for
         // to the last, whatever the steps.)
         let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
-        for op in &ops {
-            let to = match &op.to {
-                To::Copy(to, dst) => Some((to, *dst)),
-                _ => None,
-            };
-            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
-                let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
-                (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
+        let mut last_span: Option<(usize, Arc<Shadow>, usize, usize)> = None;
+        let mut push_span = |shadow: &Arc<Shadow>, at: usize, len: usize| {
+            let key = Arc::as_ptr(shadow) as usize;
+            if let Some((lk, _, a, b)) = &mut last_span
+                && *lk == key
+            {
+                *a = (*a).min(at);
+                *b = (*b).max(at + len);
+                return;
             }
+            if let Some((lk, ls, a, b)) = last_span.take() {
+                let span = spans.entry(lk).or_insert_with(|| (ls, a, b));
+                (span.1, span.2) = (span.1.min(a), span.2.max(b));
+            }
+            last_span = Some((key, shadow.clone(), at, at + len));
+        };
+        for op in &ops {
+            push_span(&op.from.0, op.from.1, op.len);
+            if let To::Copy(to, dst) = &op.to {
+                push_span(to, *dst, op.len);
+            }
+        }
+        if let Some((lk, ls, a, b)) = last_span.take() {
+            let span = spans.entry(lk).or_insert_with(|| (ls, a, b));
+            (span.1, span.2) = (span.1.min(a), span.2.max(b));
         }
         for (shadow, from, to) in spans.into_values() {
             shadow.refresh(&own.list, from as u64, (to - from) as u64);
         }
         let mut copied = Vec::new();
+        let mut copies = 0usize;
         for op in &ops {
             if let To::Copy(to, dst) = &op.to {
                 to.gpu_writes(&own.list, *dst as u64, op.len as u64);
                 copied.push((to.clone(), *dst, *dst + op.len));
+                copies += 1;
             }
         }
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
-        for level in 0..=levels {
-            let mut reads = Vec::new();
+        if levels == 0 {
+            let mut reads = Vec::with_capacity(places.len());
             let mut writes = Vec::new();
-            for op in ops.iter().filter(|op| op.level == level) {
+            for op in &ops {
                 let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
+                if op.read_first {
+                    reads.push((&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len));
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
@@ -828,7 +938,29 @@ impl Host {
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            record(true, &own.list.list, &own.between, &reads, &writes);
+        } else {
+            let mut by_level: Vec<Vec<usize>> = vec![Vec::new(); levels as usize + 1];
+            for (idx, op) in ops.iter().enumerate() {
+                by_level[op.level as usize].push(idx);
+            }
+            for (level, idxs) in by_level.iter().enumerate() {
+                let mut reads = Vec::new();
+                let mut writes = Vec::new();
+                for &idx in idxs {
+                    let op = &ops[idx];
+                    let len = op.len as u64;
+                    if op.read_first {
+                        reads.push((&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len));
+                    }
+                    match &op.to {
+                        To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
+                        To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                        To::Slot(..) => {}
+                    }
+                }
+                record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            }
         }
         own.list.close();
         // SAFETY: a live buffer.
@@ -838,17 +970,31 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
+        if parts == 1 {
+            crate::descriptor::with_constant_heaps(|set| {
+                for op in &ops {
+                    if let To::Slot(heap, index) = &op.to {
+                        set(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    }
+                }
+            });
+        } else {
+            let mut buckets: [Vec<(usize, u32, u64, u32)>; 8] = Default::default();
             for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                if let To::Slot(heap, index) = &op.to {
+                    buckets[*index as usize / 4 % 8].push((*heap, *index, op.at, op.len as u32));
                 }
             }
-        });
-        let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
+            crate::land::each_under(parts, &|part| {
+                if !buckets[part].is_empty() {
+                    crate::descriptor::with_constant_heaps(|set| {
+                        for &(heap, index, at, len) in &buckets[part] {
+                            set(heap, index, &own.between, gpu + at, len);
+                        }
+                    });
+                }
+            });
+        }
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);

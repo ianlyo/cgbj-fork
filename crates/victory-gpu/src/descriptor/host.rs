@@ -40,6 +40,12 @@ impl Slots {
         })
     }
 
+    fn contains(&self, slot: u32) -> bool {
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|bits| bits.load(std::sync::atomic::Ordering::Acquire) & (1 << (slot % 64)) != 0)
+    }
+
     fn of(n: usize, mut bits: u64, out: &mut Vec<u32>, which: &impl Fn(u32) -> bool) {
         while bits != 0 {
             let slot = n as u32 * 64 + bits.trailing_zeros();
@@ -188,6 +194,10 @@ pub(crate) struct HostHeap {
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Slots,
+    /// Title slots currently tracked in `textures`.
+    texture_slots: Slots,
+    /// Title slots currently tracked in `placed`.
+    placed_slots: Slots,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -1617,6 +1627,8 @@ impl HostHeap {
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
+            texture_slots: Slots::new(count as usize),
+            placed_slots: Slots::new(count as usize),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2594,8 +2606,9 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
+            if tabled_out() && self.texture_slots.contains(index) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                self.texture_slots.remove(index);
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
@@ -2631,8 +2644,8 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
@@ -2640,7 +2653,10 @@ impl HostHeap {
                 0
             };
             textures.written(index, frame, due, seen);
-        } else {
+            self.texture_slots.put(index);
+        } else if self.texture_slots.contains(index) {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            self.texture_slots.remove(index);
             textures.remove(index);
         }
     }
@@ -2715,14 +2731,13 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let stale = if let Some((resource, start, first, held)) = placed_view {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let span = placed_view.and_then(|(resource, start, first, held)| {
-                Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
-            });
+            let span = placed.bytes(resource).map(|bytes| (start, start.saturating_add(bytes), first, held));
             match span {
                 Some((start, end, first, held)) => {
+                    self.placed_slots.put(index);
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
@@ -2733,15 +2748,24 @@ impl HostHeap {
                     stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()
                 }
                 None => {
+                    self.placed_slots.remove(index);
                     placed.forget(index);
                     Vec::new()
                 }
             }
+        } else if self.placed_slots.contains(index) {
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            self.placed_slots.remove(index);
+            placed.forget(index);
+            Vec::new()
+        } else {
+            Vec::new()
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &(slot, _) in &stale {
+                self.texture_slots.remove(slot);
                 textures.remove(slot);
             }
         }
@@ -3257,7 +3281,11 @@ impl HostHeap {
                 self.made.set(index, 0);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
-            } else if for_draw {
+            } else if for_draw
+                && (self.buffers.contains(index)
+                    || self.texture_slots.contains(index)
+                    || self.placed_slots.contains(index))
+            {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
             }
@@ -3347,6 +3375,12 @@ impl HostHeap {
         if let Some(quick) = self.quick.get(index as usize) {
             quick.store(key, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    pub(crate) fn quick_key(&self, index: u32) -> u64 {
+        self.quick
+            .get(index as usize)
+            .map_or(0, |quick| quick.load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).

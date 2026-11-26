@@ -637,13 +637,21 @@ struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    /// Per-slot `(view_key, buffers_epoch, written)` cache so unchanged slots
+    /// skip `view_at` + `buffer_copy` on periodic `heap_spread` checks.
+    meta: Vec<(u64, u64, bool)>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self {
+            passes: 0,
+            ranges: HeapRanges(Vec::new()),
+            meta: Vec::new(),
+            unwatched: Default::default(),
+        }
     }
 }
 
@@ -661,6 +669,7 @@ impl<T> HeapRanges<T> {
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
+    #[cfg(test)]
     fn forget_part(&mut self, part: u32, parts: u32) {
         self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
@@ -887,20 +896,35 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, ranges, meta, unwatched } = &mut *kept;
+    let epoch = crate::shadow::buffers_changed();
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
         ranges.0.clear();
+        meta.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
+        for &slot in &changed {
+            if let Some(m) = meta.get_mut(slot as usize) {
+                *m = (0, 0, false);
+            }
+        }
         let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
+        if !changed.is_empty() {
+            slots.extend(changed);
+            slots.sort_unstable();
+            slots.dedup();
+        }
         slots
     } else {
+        for &slot in &changed {
+            if let Some(m) = meta.get_mut(slot as usize) {
+                *m = (0, 0, false);
+            }
+        }
         changed
     };
     *passes += 1;
@@ -920,28 +944,50 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
     }
     let heap = Shared(heap);
-    // What a slot of the title's shows: its copy and range, and whether it is
-    // an unordered view.
-    let look = |index: u32| {
+    enum SlotLook {
+        Keep(bool),
+        Clear,
+        Set(u64, (std::sync::Arc<crate::shadow::Shadow>, u64, u64), bool),
+    }
+    let look = |index: u32| -> SlotLook {
         // A draw's table's: the draw brings what it reads up to date.
         if host.copied_tabled(index, frame) {
-            return None;
+            return SlotLook::Clear;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let Some(handle) = heap.handle(index) else {
+            return SlotLook::Clear;
+        };
+        let key_info = crate::descriptor::slot_key(handle);
+        if let Some((i, generation, key)) = key_info
+            && let Some(&(cached_key, cached_epoch, written)) = meta.get(index as usize)
+            && cached_key == key
+            && key != 0
+            && cached_epoch == epoch
+            && host.quick_key(index) == key
+            && crate::descriptor::view_alive(i, generation)
+        {
+            return SlotLook::Keep(written);
+        }
+        let Some(view) = host.mirror(index, handle, true) else {
+            return SlotLook::Clear;
+        };
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            return SlotLook::Clear;
+        };
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        Some(((shadow, address, address + len), written))
+        let key = key_info.map_or(0, |(_, _, k)| k);
+        SlotLook::Set(key, (shadow, address, address + len), written)
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 256;
     let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
-    let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+    let found: Vec<std::sync::OnceLock<Vec<(u32, SlotLook)>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {
         let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
         // (After each piece while the device lives: a cheap query.)
@@ -959,14 +1005,31 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         let _ = found[n].set(looked);
     });
-    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
-            if written {
-                unordered.push(range.clone());
+    for (index, outcome) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+        match outcome {
+            SlotLook::Keep(written) => {
+                if written && let Some(Some(range)) = ranges.0.get(index as usize) {
+                    unordered.push(range.clone());
+                }
             }
-            range
-        });
-        ranges.set(index, range);
+            SlotLook::Clear => {
+                ranges.set(index, None);
+                if let Some(m) = meta.get_mut(index as usize) {
+                    *m = (0, 0, false);
+                }
+            }
+            SlotLook::Set(key, range, written) => {
+                if written {
+                    unordered.push(range.clone());
+                }
+                ranges.set(index, Some(range));
+                let idx = index as usize;
+                if idx >= meta.len() {
+                    meta.resize(idx + 1, (0, 0, false));
+                }
+                meta[idx] = (key, epoch, written);
+            }
+        }
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);

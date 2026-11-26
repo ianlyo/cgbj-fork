@@ -658,6 +658,39 @@ pub(crate) fn constant_slot(
     }
 }
 
+/// Runs `f` with a batch setter for dynamic constant-buffer slots, holding
+/// the heap registry lock once and caching the last resolved heap.
+#[cfg(windows)]
+pub(crate) fn with_constant_heaps(
+    f: impl FnOnce(&mut dyn FnMut(usize, u32, &windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64, u32)),
+) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut last: Option<(usize, Option<&host::HostHeap>)> = None;
+    let mut set = |heap: usize,
+                   index: u32,
+                   buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+                   gpu: u64,
+                   size: u32| {
+        let host = match last {
+            Some((h, host)) if h == heap => host,
+            _ => {
+                let found = heaps
+                    .iter()
+                    .any(|&(_, _, h)| h == heap)
+                    // SAFETY: registered heaps are live (removed while `heaps` is locked).
+                    .then(|| unsafe { &*(heap as *const Heap) }.host.get().and_then(|o| o.as_ref()))
+                    .flatten();
+                last = Some((heap, found));
+                found
+            }
+        };
+        if let Some(host) = host {
+            host.constant_at(index, buffer, gpu, size);
+        }
+    };
+    f(&mut set);
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
@@ -1260,6 +1293,24 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
+}
+
+/// Returns whether `(i, generation)` still names a live view without cloning it.
+pub(crate) fn view_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        CONSTANT => true,
+        0 => views_read().list.get(i as usize).is_some_and(|(_, current)| *current == generation),
+        PLACED => views_read().placed_of(i, generation).is_some(),
+        _ => false,
+    }
+}
+
+/// Reads `(index, generation, quick_key)` from a title descriptor handle if it
+/// holds a view tag.
+pub(crate) fn slot_key(handle: u64) -> Option<(u32, u32, u64)> {
+    let [tag, i, generation] = record_at(handle)?;
+    let _ = tag;
+    Some((i, generation, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// The words of the record at `handle`, if they are a view's.
