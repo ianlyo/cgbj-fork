@@ -1083,22 +1083,6 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn dump_f1687692() {
-        let bytes = std::fs::read(r"C:\Users\Ian\.gemini\antigravity\brain\299a5da0-fb94-4d00-825e-9bc1ca98c46b\scratch\f1687692.dxbc").unwrap();
-        let c = super::Container::parse(&bytes).unwrap();
-        let xbop = c.part(super::FourCC::DXIL).unwrap();
-        let native = crate::native_programs(xbop.data).unwrap().into_iter().next().unwrap();
-        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let st = crate::structure::structure(&p).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
-        let host = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
-        let ll = dump_dxil(&host.dxil).unwrap();
-        std::fs::write(r"C:\Users\Ian\.gemini\antigravity\brain\299a5da0-fb94-4d00-825e-9bc1ca98c46b\scratch\f1687692.ll", &ll).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
     fn interpolated_f16_writes_the_op_sel_half_with_modifiers() {
         // p1_f32 v2, v0, attr0.x; then a p2_f16 completing it into v3, which holds a value
         // (v2's own is no number here: a first half is evaluated with its second).
