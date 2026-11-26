@@ -3324,7 +3324,7 @@ impl State {
 
     /// The light probe after a draw or dispatch (`crate::lightprobe`).
     fn light_probe(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
-        use crate::lightprobe::{AVERAGE, BEFORE, LUX_BEFORE, LUX_IN, LUX_OUT, Role};
+        use crate::lightprobe::{AVERAGE, BEFORE, LUX_IN, LUX_OUT, Role};
         let Some(stage) = p.stages.iter().find(|s| s.shader.probe.is_some()) else {
             return;
         };
@@ -3344,12 +3344,7 @@ impl State {
                 self.table_handle(t, true, ResourceType::Srv, LUX_IN),
                 self.table_handle(t, true, ResourceType::Uav, LUX_OUT),
             ) {
-                (Some(a), Some(b)) => crate::lightprobe::after_lux(
-                    list,
-                    a,
-                    b,
-                    self.table_handle(t, true, ResourceType::Srv, LUX_BEFORE),
-                ),
+                (Some(a), Some(b)) => crate::lightprobe::after_lux(list, a, b),
                 _ => {
                     once!("light probe: the lux program's views are not where they were");
                     false

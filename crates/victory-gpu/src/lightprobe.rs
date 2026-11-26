@@ -41,11 +41,19 @@ pub(crate) enum Role {
     Lux,
 }
 
+/// The lux program is looked at too (`VICTORY_LIGHT_PROBE_LUX=1`; off: run
+/// light-21 lost the device in the pass after it, with a view of the frame
+/// before bound as a raw buffer where the plain form has a texture).
+fn lux_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIGHT_PROBE_LUX").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
     if has(b"PS_CalculateExposure") {
         Some(Role::Exposure)
-    } else if has(b"ComputeLuxCompressionInfo") {
+    } else if lux_on() && has(b"ComputeLuxCompressionInfo") {
         Some(Role::Lux)
     } else {
         None
@@ -59,8 +67,6 @@ pub(crate) const BEFORE: (u8, u32) = (1, 16);
 /// The lux program's input (5x1) and output (16 bytes).
 pub(crate) const LUX_IN: (u8, u32) = (1, 8);
 pub(crate) const LUX_OUT: (u8, u32) = (1, 24);
-/// The smooth form's factor of the frame before (16 bytes, read).
-pub(crate) const LUX_BEFORE: (u8, u32) = (1, 0);
 
 fn file() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
     static FILE: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
@@ -69,7 +75,7 @@ fn file() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&path).ok()?);
         let _ = writeln!(
             f,
-            "frame,ms,avg0,avg1,avg2,avg3,exp,logexp,target,exp3,lux,luxinv,lux2,lux3,in0,in1,in2,in3,samples,title,standin,written,mean_r,mean_g,mean_b,luxbefore,luxbefore1"
+            "frame,ms,avg0,avg1,avg2,avg3,exp,logexp,target,exp3,lux,luxinv,lux2,lux3,in0,in1,in2,in3,samples,title,standin,written,mean_r,mean_g,mean_b"
         );
         tracing::info!(path = %std::path::Path::new(&path).display(), "light probe: a line a frame (VICTORY_LIGHT_PROBE)");
         Some(Mutex::new(f))
@@ -83,7 +89,7 @@ pub(crate) fn on() -> bool {
 }
 
 const RS_EXPOSURE: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(SRV(t1)), UAV(u0), UAV(u1), UAV(u2)";
-const RS_LUX: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u3)), UAV(u0), DescriptorTable(SRV(t2))";
+const RS_LUX: &str = "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u3)), UAV(u0)";
 
 /// Dwords a record; records in the ring.
 const RECORD: u64 = 64;
@@ -113,22 +119,18 @@ void exposure() {
         ring.Store4(at + 64, uint4(0, 0, 0, 0));
         ring.Store4(at + 80, uint4(0, 0, 0, 0));
     }
-    ring.Store4(at + 96, uint4(0, 0, 0, 0));
     ring.Store(at + 252, record + 1);
 }
 #endif
 #ifdef LUX
 Texture2D<float4> input : register(t0);
 RWByteAddressBuffer output : register(u3);
-ByteAddressBuffer before : register(t2);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void lux() {
     uint at = record * 256;
     ring.Store4(at + 32, output.Load4(0));
     ring.Store4(at + 48, asuint(input.Load(int3(0, 0, 0))));
-    // (`cells`: whether the smooth form's view of the frame before is bound.)
-    ring.Store4(at + 96, cells != 0 ? before.Load4(0) : uint4(0, 0, 0, 0));
 }
 #endif
 "#;
@@ -211,9 +213,9 @@ fn write_old(pass: &Pass, now: u64) {
         let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
         let _ = writeln!(
             file,
-            "{old},{ms},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{samples},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5}",
+            "{old},{ms},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{samples},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5}",
             f(0), f(1), f(2), f(3), f(4), f(5), f(6), f(7), f(8), f(9), f(10), f(11), f(12), f(13), f(14), f(15),
-            mean(17), mean(18), mean(19), f(20), f(21), f(22), f(24), f(25)
+            mean(17), mean(18), mean(19), f(20), f(21), f(22)
         );
         if old % 64 == 0 {
             let _ = file.flush();
@@ -263,17 +265,12 @@ pub(crate) fn after_exposure(list: &HostList, average: D3D12_GPU_DESCRIPTOR_HAND
 }
 
 /// After the lux program's dispatch: its input and output.
-pub(crate) fn after_lux(
-    list: &HostList,
-    input: D3D12_GPU_DESCRIPTOR_HANDLE,
-    output: D3D12_GPU_DESCRIPTOR_HANDLE,
-    before: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
-) -> bool {
+pub(crate) fn after_lux(list: &HostList, input: D3D12_GPU_DESCRIPTOR_HANDLE, output: D3D12_GPU_DESCRIPTOR_HANDLE) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
     let n = ASKED.load(Relaxed).saturating_sub(1);
-    let words = [(n % RING) as u32, u32::from(before.is_some()), 0, 0];
+    let words = [(n % RING) as u32, 0, 0, 0];
     list.keep(&pass.ring);
     let l = &list.list;
     // SAFETY: as in `after_exposure`.
@@ -285,8 +282,6 @@ pub(crate) fn after_lux(
         l.SetComputeRootDescriptorTable(1, input);
         l.SetComputeRootDescriptorTable(2, output);
         l.SetComputeRootUnorderedAccessView(3, pass.ring.GetGPUVirtualAddress());
-        // (Not read without it: the input's place stands in.)
-        l.SetComputeRootDescriptorTable(4, before.unwrap_or(input));
         l.Dispatch(1, 1, 1);
         uav_barrier(l);
     }
@@ -300,7 +295,7 @@ mod tests {
     #[test]
     fn roles_by_name() {
         assert_eq!(role(b"..PS_CalculateExposure_396dfccc_Wrapped.."), Some(Role::Exposure));
-        assert_eq!(role(b"avgLuminanceCompute:ComputeLuxCompressionInfoSmooth_5b8554dd"), Some(Role::Lux));
+        assert_eq!(role(b"avgLuminanceCompute:ComputeLuxCompressionInfoSmooth_5b8554dd"), lux_on().then_some(Role::Lux));
         assert_eq!(role(b"PS_SetExposurePrevious"), None);
     }
 
