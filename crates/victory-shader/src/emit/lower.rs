@@ -6544,7 +6544,16 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // Mark raw buffer handles non-uniform for `getDimensions`: amdxc64.dll
+        // crashes (`0xc0000005`) when `getDimensions` uses a uniform
+        // `ResourceDescriptorHeap` handle for a raw buffer inside a loop.
+        let h = if image.is_none() && props.0 & 0xFF == 11 {
+            let index = self.heap_index(site, first, false)?;
+            let (index, bounded) = self.raw_twin(&src, index, false, props);
+            self.s.heap_handle_at(self.cur, index, false, true, props, bounded)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
