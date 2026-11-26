@@ -1348,6 +1348,9 @@ pub(crate) fn want_level(this: This, first: u32) {
     if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
         return;
     }
+    if r.desc.mip_levels > 1 {
+        crate::texlate::viewed(this as usize, first);
+    }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     let Some((host, _)) = made.as_ref() else {
         r.host.wanted.fetch_min(first, Relaxed);
@@ -2726,6 +2729,7 @@ impl Drop for Resource {
         if self.desc.dimension != BUFFER {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
+            crate::texlate::gone(address);
             textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());

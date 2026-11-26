@@ -1712,7 +1712,7 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
-            if stage.shader.ambient.is_some() {
+            if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
             }
@@ -3227,6 +3227,9 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
+        if p.stages.first().is_some_and(|s| s.shader.probe.is_some()) {
+            self.light_probe(list, p, true);
+        }
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
@@ -3236,30 +3239,7 @@ impl State {
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
-        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
-        else {
-            return false;
-        };
-        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
-            t.used.iter().find(|u| {
-                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })?;
-            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
-                return None;
-            };
-            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-                View::Shader(r, _) | View::Unordered(r, ..) => r,
-                _ => return None,
-            };
-            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
-                Some(m) => m.1,
-                None => self.user_value(true, slot, RootType::Table, 0),
-            };
-            let host = crate::resource::host_resource(resource as This)?;
-            // SAFETY: a live resource.
-            let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
-        };
+        let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
@@ -3287,6 +3267,100 @@ impl State {
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
         })
+    }
+
+    /// The view a shader of the bound pipeline reads through a table, at
+    /// (root parameter, dwords into the table): its texture's or buffer's
+    /// description and its place in the bound view heap. Tables made afresh
+    /// for the draw are found where they were made (`ambient_tables`).
+    fn table_view(
+        &self,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        kind: ResourceType,
+        (slot, offset): (u8, u32),
+    ) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()?;
+        t.used.iter().find(|u| {
+            u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        })?;
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return None;
+        };
+        let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+            View::Shader(r, _) | View::Unordered(r, ..) => r,
+            _ => return None,
+        };
+        let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+            Some(m) => m.1,
+            None => self.user_value(compute, slot, RootType::Table, 0),
+        };
+        let host = crate::resource::host_resource(resource as This)?;
+        // SAFETY: a live resource.
+        let desc = unsafe { host.GetDesc() };
+        Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+    }
+
+    /// The place in the bound view heap of the view a shader of the bound
+    /// pipeline reads through a table at (root parameter, dwords into the
+    /// table), whatever it views (buffers too).
+    fn table_handle(
+        &self,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        kind: ResourceType,
+        (slot, offset): (u8, u32),
+    ) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()?;
+        t.used.iter().find(|u| {
+            u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+        })?;
+        let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+            Some(m) => m.1,
+            None => self.user_value(compute, slot, RootType::Table, 0),
+        };
+        Some(heap.gpu_handle((start + offset * 4) / 32))
+    }
+
+    /// The light probe after a draw or dispatch (`crate::lightprobe`).
+    fn light_probe(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        use crate::lightprobe::{AVERAGE, BEFORE, LUX_BEFORE, LUX_IN, LUX_OUT, Role};
+        let Some(stage) = p.stages.iter().find(|s| s.shader.probe.is_some()) else {
+            return;
+        };
+        let t = stage.translated();
+        let done = match (stage.shader.probe, compute) {
+            (Some(Role::Exposure), false) => match (
+                self.table_handle(t, false, ResourceType::Srv, AVERAGE),
+                self.table_handle(t, false, ResourceType::Srv, BEFORE),
+            ) {
+                (Some(a), Some(b)) => crate::lightprobe::after_exposure(list, a, b),
+                _ => {
+                    once!("light probe: the exposure program's inputs are not where they were");
+                    false
+                }
+            },
+            (Some(Role::Lux), true) => match (
+                self.table_handle(t, true, ResourceType::Srv, LUX_IN),
+                self.table_handle(t, true, ResourceType::Uav, LUX_OUT),
+            ) {
+                (Some(a), Some(b)) => crate::lightprobe::after_lux(
+                    list,
+                    a,
+                    b,
+                    self.table_handle(t, true, ResourceType::Srv, LUX_BEFORE),
+                ),
+                _ => {
+                    once!("light probe: the lux program's views are not where they were");
+                    false
+                }
+            },
+            _ => false,
+        };
+        if done {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3565,7 +3639,7 @@ impl State {
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -4040,7 +4114,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4145,7 +4219,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4168,9 +4242,14 @@ impl State {
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
-    fn drew(&mut self, p: Option<&HostPipeline>) {
+    fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
             self.batch = None;
+        }
+        if let Some(p) = p
+            && p.stages.iter().any(|s| s.shader.probe.is_some())
+        {
+            self.light_probe(list, p, false);
         }
     }
 
@@ -4441,7 +4520,7 @@ impl State {
         if kind == DISPATCH {
             self.buffers_written();
         } else {
-            self.drew(Some(p));
+            self.drew(list, Some(p));
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
