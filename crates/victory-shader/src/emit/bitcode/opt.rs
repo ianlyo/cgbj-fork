@@ -194,8 +194,8 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Effect {
     /// Nothing, and the result depends on the arguments alone for the whole
-    /// run of the shader (arithmetic, handles, inputs, constant buffers,
-    /// resource sizes).
+    /// run of the shader (arithmetic, inputs, constant buffers, resource
+    /// sizes).
     Pure,
     /// Nothing, but the result depends on memory a store may change
     /// (buffer and texture reads).
@@ -209,6 +209,14 @@ pub(super) enum Effect {
 
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
+    // Reusing DXIL handles across blocks (via REUSE/GVN) crashes amdxc64.dll
+    // during CreateComputePipelineState / pipeline creation.
+    if matches!(
+        name,
+        "createHandle" | "createHandleFromBinding" | "createHandleFromHeap" | "annotateHandle"
+    ) {
+        return Effect::Writes;
+    }
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
@@ -2224,5 +2232,30 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn handles_are_not_reused_across_blocks() {
+        let Diamond {
+            k: Kit { mut m, b, writes, .. },
+            x,
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(fty);
+        let create = m.function("dx.op.createHandleFromHeap", fty, Some(Attr::ReadNone), false);
+        let ann = m.function("dx.op.annotateHandle", fty, Some(Attr::ReadNone), false);
+
+        let h0 = m.call(b, create, vec![x, x]);
+        let a0 = m.call(b, ann, vec![h0, x]);
+        m.call(b, writes, vec![a0, a0]);
+        let h1 = m.call(then, create, vec![x, x]);
+        let a1 = m.call(then, ann, vec![h1, x]);
+        m.call(then, writes, vec![a1, a1]);
+        m.optimise(REUSE | LOADS | DEAD);
+        assert_eq!(stores(&m, then), [[a1, a1]]);
+        assert_eq!(body(&m, then), 3);
     }
 }
